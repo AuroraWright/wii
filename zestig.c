@@ -540,7 +540,7 @@ int main(int argc, char **argv)
       if(size != 0x400)
         fatal("error: Not a valid wiiu otp");
     }
-    else if(size != 0x80)
+    else if(size != 0x80 && size != 0x400)
       fatal("error: Not a valid wii otp");
     void *otpdata = mmap(0, size, PROT_READ, MAP_SHARED, fd, 0);
     if(otpdata==NULL)
