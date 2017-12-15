@@ -6,7 +6,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 
 #include "tools.h"
 #include "my_getopt.h"
@@ -23,6 +22,7 @@ int verify_hmac = 0;
 int verify_boot1 = 0;
 int otp_used = 0;
 int force_old_sffs = 0;
+int iswiiu = 0;
   
 static const u8 *rom;
 static const u8 *super;
@@ -45,6 +45,7 @@ static u8 boot1key[16] = {0x92, 0x58, 0xA7, 0x52, 0x64, 0x96, 0x0D, 0x82, 0x67, 
 static u8 boot1iv[16] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 };
 
 static const u32 console_ids[2] = { 0x021DFFFF, 0x06000000 };
+static const u32 superblock_magic[2] = { 0x53464653, 0x53465321 };
 
 static int verify_boot1_hash(u32 id)
 {
@@ -140,22 +141,30 @@ static const u8 *find_super(void)
 {
 	u32 newest = 0;
 	const u8 *super = 0, *p;
-  int start = 0x1fc00000;
-  int end = 0x20000000;
-  int add = 0x40000;
+  int start;
+  int end;
+  int add;
   int i,j,old=0;
   u8 block_hmac[40];
   u8 hmac_super[20];
   
   if(out_of_band)
   {
-    start=0x20BE0000;
+    if(iswiiu) start = 0x1ff80000;
+    else start = 0x20be0000;
     end = 0x21000000;
     add = 0x42000;
   }
+  else
+  {
+    if(iswiiu) start = 0x1f000000;
+    else start = 0x1fc00000;
+    end = 0x20000000;
+    add = 0x40000;
+  }
   
 	for (p = rom + start,j=0; p < rom + end; p += add,j++)
-		if (be32(p) == 0x53464653) {
+		if (be32(p) == superblock_magic[iswiiu]) {
 			u32 version = be32(p + 4);
 			if (super == 0 || version > newest) {
         if(out_of_band)
@@ -167,9 +176,12 @@ static const u8 *find_super(void)
         }
         if(verify_hmac)
         {
+          int loc;
+          if(iswiiu) loc = 0x7C00;
+          else loc = 0x7F00;
           memcpy(block_hmac,p+add-0x87F,32);
           memcpy(block_hmac+32,p+add-0x3F,8);
-          fs_hmac_meta(superblock,0x7F00+(0x10*j),hmac_super);
+          fs_hmac_meta(superblock,loc+(0x10*j),hmac_super);
           if(memcmp(hmac_super,block_hmac,20) && memcmp(hmac_super,block_hmac+20,20))
           {
             fprintf(stdout,"Warning: HMAC for superblock %d is invalid. Not using this block\n",j);
@@ -199,6 +211,24 @@ static const u8 *find_super(void)
       fprintf(stdout, "Forcing use of Super block %d\n",old);
     }
 	return super;
+}
+
+static int detect_console(void)
+{
+  int offset;
+  
+  if(out_of_band)
+  {
+    offset = 0x20FBE000;
+  }
+  else
+  {
+    offset = 0x1FFC0000;
+  }
+  
+  if (be32(rom + offset) == superblock_magic[1]) iswiiu = 1;
+  else if (be32(rom + offset) != superblock_magic[0]) return 1;
+  return 0;
 }
 
 static void print_mode(u8 mode)
@@ -391,7 +421,7 @@ void print_help()
   printf("  --oob          Use out of band (extra data) if it exists\n");
   printf("  --ecc          Verifies ecc data. (Requires --oob)\n");
   printf("  --hmac         Verifies superblock/file hmac (Requires --oob)\n");
-  printf("  --boot1        Verifies boot1 hash\n");
+  printf("  --boot1        Verifies boot1 hash (Wii NANDs only)\n");
   printf("  --sffs=NUM     Force use of previous by NUM sffs.  (If block NUM=1 and block 4 is being");
   printf("                 extracted, extract block 3 instead)\n");
   printf("  --out=PATH     Where to store dumped files. Defaults to ./wiiflash/");
@@ -403,7 +433,6 @@ void print_help()
 
 int main(int argc, char **argv)
 {
-  char path[256];
   char wiiname[256] = "default";
   char otp[256] = {0};
   char nanddump[256] = {0};
@@ -488,7 +517,9 @@ int main(int argc, char **argv)
     printf("error: You must specify a nand file to extract\n");
     exit(0);
   }
-  if(nandotp)
+  if(detect_console())
+    fatal("error: Unknown nand type\n");
+  if(!iswiiu && nandotp)
   {
     memcpy(hash,rom+0x21000100,20);
     memcpy(&console_id,rom+0x21000124,4);
@@ -501,24 +532,51 @@ int main(int argc, char **argv)
     int fd = open(otp, O_RDONLY);
     if(fd<0)
       fatal("Could not open otp file %s",otp);
-    void *otpdata = mmap(0, 0x100, PROT_READ, MAP_SHARED, fd, 0);
+    struct stat st;
+    fstat(fd, &st);
+    int size = st.st_size;
+    if(iswiiu)
+    {
+      if(size != 0x400)
+        fatal("error: Not a valid wiiu otp");
+    }
+    else if(size != 0x80)
+      fatal("error: Not a valid wii otp");
+    void *otpdata = mmap(0, size, PROT_READ, MAP_SHARED, fd, 0);
     if(otpdata==NULL)
       fatal("Could not allocate memory for otp file %s",otp);
     close(fd);
-    memcpy(hash,otpdata+0x24,20);
-    memcpy(&console_id,otpdata,4);
-    memcpy(key,otpdata+0x58,16);
-    memcpy(hmac,otpdata+0x44,20);  //Why not, its already here.
+    if(iswiiu)
+    {
+      memcpy(key,otpdata+0x170,16);
+      memcpy(hmac,otpdata+0x1E0,20);
+    }
+    else
+    {
+      memcpy(hash,otpdata,20);
+      memcpy(&console_id,otpdata+0x24,4);
+      memcpy(key,otpdata+0x58,16);
+      memcpy(hmac,otpdata+0x44,20);  //Why not, its already here.
+    }
     otp_used = 1;
   }
   else
   {
-    get_wii_key(wiiname,"nand-key",key,16,0);
-    if(verify_hmac)
-      get_wii_key(wiiname,"nand-hmac",hmac,20,0);
-    if(verify_boot1)
-      if(get_wii_key(wiiname,"NG-id",(u8*)&console_id,4,1))
-        console_id = 0xFFFFFFFF;
+    if(!iswiiu)
+    {
+      get_wii_key(wiiname,"nand-key",key,16,0);
+      if(verify_hmac)
+        get_wii_key(wiiname,"nand-hmac",hmac,20,0);
+      if(verify_boot1)
+        if(get_wii_key(wiiname,"NG-id",(u8*)&console_id,4,1))
+          console_id = 0xFFFFFFFF;
+    }
+    else
+    {
+      get_wii_key(wiiname,"wiiu-nand-key",key,16,0);
+      if(verify_hmac)
+        get_wii_key(wiiname,"wiiu-nand-hmac",hmac,20,0);
+    }
   }
 	
   if(verify_ecc)
@@ -555,7 +613,7 @@ int main(int argc, char **argv)
       fs_hmac_set_key(hmac,20);
     }
   }
-  if(verify_boot1)
+  if(!iswiiu && verify_boot1)
   {
     fprintf(stderr,"Verifying boot1");
     if(console_id < 0xFFFFFFFF)
@@ -598,8 +656,11 @@ int main(int argc, char **argv)
   	fst = fat + 0x10000;
   if(nanddump[0]==0)
   {
-    mkdir("wiiflash",0777);
-    chdir("wiiflash");
+    const char *defaultpath;
+    if(iswiiu) defaultpath = "wiiuflash";
+    else defaultpath = "wiiflash";
+    mkdir(defaultpath,0777);
+    chdir(defaultpath);
   }
   else
   {
